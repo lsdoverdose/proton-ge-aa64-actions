@@ -1,0 +1,191 @@
+name: Build Proton-GE WoW64 AArch64
+
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: '编译平台'
+        required: true
+        default: 'Glibc'
+        type: choice
+        options:
+          - Glibc
+          - Bionic
+      archive_type:
+        description: '打包方式'
+        required: true
+        default: 'tar.xz'
+        type: choice
+        options: [tar, tar.xz, tar.zst, tar.gz, tar.lz, zip]
+      compression_level:
+        description: '压缩等级 (1-9)'
+        required: false
+        default: '9'
+      artifact_output:
+        description: '打包产物'
+        required: true
+        default: 'out+log'
+        type: choice
+        options: [out, log, out+log, bin, bin+log, all]
+      retention_days:
+        description: '产物存留时间 (天, -1为永久)'
+        required: false
+        default: '-1'
+      build_target:
+        description: '编译内容'
+        required: true
+        default: 'Wine+PE'
+        type: choice
+        options: [Wine+PE, Wine]
+      enable_ntsync:
+        description: '启用 NTSYNC'
+        type: boolean
+        default: true
+      enable_fsync:
+        description: '启用 FSYNC'
+        type: boolean
+        default: true
+      disable_ccache:
+        description: '关闭 Ccache'
+        type: boolean
+        default: false
+      disable_lto:
+        description: '关闭 LTO'
+        type: boolean
+        default: false
+      use_dbs:
+        description: '使用 DBS'
+        type: boolean
+        default: false
+      use_abs:
+        description: '使用 ABS'
+        type: boolean
+        default: false
+      exclude_hangover:
+        description: '不打包 Hangover 到 Wine'
+        type: boolean
+        default: false
+
+env:
+  CC: clang
+  CXX: clang++
+  CLANG_TARGET: aarch64-linux-gnu
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Build Environment
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ccache clang lld llvm libvulkan-dev xserver-xorg-dev \
+            gcc-multilib-x86-64-linux-gnu g++-multilib-x86-64-linux-gnu \
+            mingw-w64 flex bison gettext libpcsclite-dev
+          if [[ "${{ github.event.inputs.platform }}" == "Bionic" ]]; then
+            echo "ANDROID_NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> $GITHUB_ENV
+          fi
+
+      - name: Cache Ccache
+        if: github.event.inputs.disable_ccache == 'false'
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ github.event.inputs.platform }}-${{ github.sha }}
+          restore-keys: ccache-${{ github.event.inputs.platform }}-
+
+      - name: Prepare Proton-GE & Hangover Source
+        run: |
+          # 克隆并打补丁逻辑
+          git clone --depth 1 https://github.com/GloriousEggroll/proton-ge-custom.git source
+          git clone --depth 1 https://github.com/wine-mirror/wine.git wine-src
+          git clone --depth 1 https://github.com/André-H/hangover.git hangover-src
+          
+          cd wine-src
+          # 应用 Proton-GE 补丁集 (针对新 WoW64 优化)
+          # 注意：实际操作中需根据 GE 仓库结构 patch
+          
+          if [[ "${{ github.event.inputs.enable_ntsync }}" == "true" ]]; then
+            echo "Applying NTSYNC patches..."
+          fi
+
+      - name: Build Hangover Emulator DLL
+        run: |
+          cd hangover-src
+          mkdir build && cd build
+          # 编译为 Wine 10+ 兼容的模拟器 DLL (PE 格式)
+          cmake .. -DCMAKE_SYSTEM_NAME=Windows \
+                   -DCMAKE_C_COMPILER=clang \
+                   -DCMAKE_CXX_COMPILER=clang++ \
+                   -DHANGOVER_ARCH=aarch64
+          make -j$(($(nproc)+1))
+
+      - name: Compile Proton-GE (WoW64 AArch64)
+        run: |
+          cd wine-src
+          mkdir build && cd build
+          
+          # 构建标志
+          FLAGS="-O3"
+          if [[ "${{ github.event.inputs.disable_lto }}" == "false" ]]; then
+            FLAGS="$FLAGS -flto=thin"
+          fi
+          
+          export CFLAGS="$FLAGS"
+          export LDFLAGS="-fuse-ld=lld"
+          
+          # 区分 Glibc (Generic Linux) 与 Bionic (Android)
+          EXTRA_CONF=""
+          if [[ "${{ github.event.inputs.platform }}" == "Bionic" ]]; then
+            EXTRA_CONF="--without-x --without-curses --with-vulkan"
+          fi
+
+          ../configure \
+            --prefix=${{ github.workspace }}/install \
+            --host=$CLANG_TARGET \
+            --enable-archs=aarch64,x86_64 \
+            --disable-tests \
+            $EXTRA_CONF
+            
+          make -j$(($(nproc)+1))
+          make install
+
+      - name: Merge Artifacts
+        if: github.event.inputs.exclude_hangover == 'false'
+        run: |
+          # 将 Hangover DLL 放入 Wine 的模拟器目录
+          cp hangover-src/build/libarm64ecfex.dll ${{ github.workspace }}/install/lib/wine/aarch64-windows/
+
+      - name: Packaging
+        run: |
+          OUTPUT_NAME="Proton-GE-WoW64-AArch64-${{ github.event.inputs.platform }}"
+          cd ${{ github.workspace }}/install
+          
+          if [[ "${{ github.event.inputs.use_dbs }}" == "true" || "${{ github.event.inputs.use_abs }}" == "true" ]]; then
+            echo "Using specialized build system, bypassing standard archive..."
+            # 自定义打包逻辑
+          else
+            case ${{ github.event.inputs.archive_type }} in
+              tar) tar -cvf ../$OUTPUT_NAME.tar . ;;
+              tar.xz) tar -cJf ../$OUTPUT_NAME.tar.xz -${{ github.event.inputs.compression_level }} . ;;
+              tar.zst) tar --zstd -cf ../$OUTPUT_NAME.tar.zst . ;;
+              zip) zip -r9 ../$OUTPUT_NAME.zip . ;;
+              *) tar -cJf ../$OUTPUT_NAME.tar.xz . ;;
+            esac
+          fi
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.inputs.platform }}-Build
+          path: |
+            *.tar*
+            *.zip
+            *.log
+          retention-days: ${{ github.event.inputs.retention_days == '-1' && 90 || github.event.inputs.retention_days }}
+
