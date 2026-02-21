@@ -180,21 +180,28 @@ jobs:
             # patch -p1 < patches/ntsync.patch || true
           fi
 
-      - name: Build Hangover Emulator DLLs (PE)
+            - name: Build Hangover Emulator DLLs (PE)
         if: github.event.inputs.exclude_hangover == 'false'
         run: |
           cd $SOURCE_DIR/hangover-src
           
-          # 初始化子模块 (Box64/FEX)
-          git submodule update --init --recursive || true
+          # 初始化子模块 (FEX, Box64 等)
+          git submodule update --init --recursive
           
           EMULATOR="${{ github.event.inputs.hangover_emulator }}"
           
           case $EMULATOR in
             fex)
               echo "Building FEX Emulators..."
-              # FEX ARM64EC (x86_64 模拟)
-              mkdir -p build-arm64ec && cd build-arm64ec
+              
+              # 检查 FEX 子模块是否存在
+              if [ ! -d "fex" ]; then
+                echo "FEX submodule not found, cloning manually..."
+                git clone --depth 1 https://github.com/FEX-Emu/FEX.git fex
+              fi
+              
+              # FEX ARM64EC (x86_64 模拟) - 使用 ARM64EC ABI
+              mkdir -p fex/build-arm64ec && cd fex/build-arm64ec
               cmake -GNinja \
                 -DCMAKE_BUILD_TYPE=Release \
                 -DCMAKE_TOOLCHAIN_FILE=../Data/CMake/toolchain_mingw.cmake \
@@ -206,9 +213,9 @@ jobs:
                 ..
               ninja libarm64ecfex || make -j$(nproc) libarm64ecfex
               
-              cd ..
-              # FEX WOW64 (x86 模拟)
-              mkdir -p build-wow64 && cd build-wow64
+              cd ../..
+              # FEX WOW64 (x86 模拟) - 标准 ARM64
+              mkdir -p fex/build-wow64 && cd fex/build-wow64
               cmake -GNinja \
                 -DCMAKE_BUILD_TYPE=Release \
                 -DCMAKE_TOOLCHAIN_FILE=../Data/CMake/toolchain_mingw.cmake \
@@ -223,11 +230,17 @@ jobs:
               
             box64)
               echo "Building Box64..."
-              # Box64 作为 PE DLL 构建
-              mkdir -p build && cd build
+              
+              # 检查 Box64 子模块
+              if [ ! -d "box64" ]; then
+                echo "Box64 submodule not found, cloning manually..."
+                git clone --depth 1 https://github.com/ptitSeb/box64.git box64
+              fi
+              
+              mkdir -p box64/build && cd box64/build
               cmake -GNinja \
                 -DCMAKE_BUILD_TYPE=Release \
-                -DCMAKE_TOOLCHAIN_FILE=../Data/CMake/toolchain_mingw.cmake \
+                -DCMAKE_TOOLCHAIN_FILE=../../Data/CMake/toolchain_mingw.cmake \
                 -DMINGW_TRIPLE=aarch64-w64-mingw32 \
                 -DBUILD_TESTING=False \
                 ..
@@ -235,12 +248,11 @@ jobs:
               ;;
               
             qemu)
-              echo "Building QEMU (已弃用，不建议使用)..."
-              mkdir -p qemu/build && cd qemu/build
-              ../configure --disable-werror --target-list=i386-linux-user
-              make -j$(nproc)
+              echo "QEMU support has been removed from Hangover, please use FEX or Box64"
+              exit 1
               ;;
           esac
+
 
       - name: Build Wine Native (Tools)
         run: |
