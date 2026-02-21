@@ -87,34 +87,66 @@ jobs:
 
       - name: Setup Build Environment
         run: |
+          # 添加 ARM64 架构支持
           sudo dpkg --add-architecture arm64
+          
+          # 修复软件源：为默认源添加 amd64 限制，并添加 ports 源用于 arm64
+          sudo tee /etc/apt/sources.list.d/ubuntu.sources << 'EOF'
+          Types: deb
+          URIs: http://archive.ubuntu.com/ubuntu/
+          Suites: noble noble-updates noble-backports
+          Components: main restricted universe multiverse
+          Architectures: amd64
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+
+          Types: deb
+          URIs: http://security.ubuntu.com/ubuntu/
+          Suites: noble-security
+          Components: main restricted universe multiverse
+          Architectures: amd64
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+
+          Types: deb
+          URIs: http://ports.ubuntu.com/ubuntu-ports/
+          Suites: noble noble-updates noble-backports
+          Components: main restricted universe multiverse
+          Architectures: arm64
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+
+          Types: deb
+          URIs: http://ports.ubuntu.com/ubuntu-ports/
+          Suites: noble-security
+          Components: main restricted universe multiverse
+          Architectures: arm64
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+          EOF
+          
           sudo apt-get update
+          
+          # 安装交叉编译工具 (amd64 架构)
           sudo apt-get install -y \
             ccache clang lld llvm \
             gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu \
             mingw-w64 mingw-w64-tools \
             flex bison gettext libpcsclite-dev \
             libvulkan-dev libvulkan1 \
-            libx11-dev:arm64 libxext-dev:arm64 \
-            libfreetype6-dev:arm64 libgnutls28-dev:arm64 \
-            libgl1-mesa-dev:arm64 libosmesa6-dev:arm64 \
-            libgstreamer1.0-dev:arm64 libgstreamer-plugins-base1.0-dev:arm64 \
-            libasound2-dev:arm64 libpulse-dev:arm64 \
-            libdbus-1-dev:arm64 libncurses-dev:arm64 \
-            libusb-1.0-0-dev:arm64 libudev-dev:arm64 \
-            libsdl2-dev:arm64 libepoxy-dev:arm64 \
             cmake ninja-build git \
-            zstd xz-utils unzip \
-            llvm-mingw-w64-tools llvm-mingw-w64-x86-64-linux-gnu
+            zstd xz-utils unzip
           
-          # 设置 llvm-mingw 工具链
-          export PATH="/usr/lib/llvm-mingw-w64/bin:$PATH"
-          echo "PATH=$PATH" >> $GITHUB_ENV
+          # 安装 ARM64 架构的运行时库 (用于交叉编译链接)
+          sudo apt-get install -y \
+            libc6:arm64 \
+            libstdc++6:arm64
+          
+          # 注意：GitHub Actions 的 Ubuntu 24.04 可能没有 llvm-mingw，需要手动安装或从源码构建
+          # 暂时使用 mingw-w64 替代
           
           if [[ "${{ github.event.inputs.platform }}" == "Bionic" ]]; then
             echo "ANDROID_NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> $GITHUB_ENV
             echo "ANDROID_NDK_ROOT=$ANDROID_NDK_LATEST_HOME" >> $GITHUB_ENV
           fi
+
 
       - name: Cache Ccache
         if: github.event.inputs.disable_ccache == 'false'
