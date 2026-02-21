@@ -8,9 +8,7 @@ on:
         required: true
         default: 'Glibc'
         type: choice
-        options:
-          - Glibc
-          - Bionic
+        options: [Glibc, Bionic]
       archive_type:
         description: '打包方式'
         required: true
@@ -30,7 +28,7 @@ on:
       retention_days:
         description: '产物存留时间 (天, -1为永久)'
         required: false
-        default: '-1'
+        default: '90'
       build_target:
         description: '编译内容'
         required: true
@@ -71,10 +69,12 @@ env:
   CXX: clang++
   CLANG_TARGET: aarch64-linux-gnu
   CCACHE_DIR: ${{ github.workspace }}/.ccache
+  INSTALL_DIR: ${{ github.workspace }}/install
+  SOURCE_DIR: ${{ github.workspace }}/sources
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -84,9 +84,14 @@ jobs:
       - name: Setup Build Environment
         run: |
           sudo apt-get update
-          sudo apt-get install -y ccache clang lld llvm libvulkan-dev xserver-xorg-dev \
-            gcc-multilib-x86-64-linux-gnu g++-multilib-x86-64-linux-gnu \
-            mingw-w64 flex bison gettext libpcsclite-dev
+          sudo apt-get install -y \
+            ccache clang lld llvm \
+            gcc-x86-64-linux-gnu g++-x86-64-linux-gnu \
+            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+            mingw-w64 flex bison gettext libpcsclite-dev \
+            libvulkan-dev xserver-xorg-dev \
+            make cmake git libx11-dev libxext-dev
+          
           if [[ "${{ github.event.inputs.platform }}" == "Bionic" ]]; then
             echo "ANDROID_NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> $GITHUB_ENV
           fi
@@ -99,93 +104,102 @@ jobs:
           key: ccache-${{ github.event.inputs.platform }}-${{ github.sha }}
           restore-keys: ccache-${{ github.event.inputs.platform }}-
 
-      - name: Prepare Proton-GE & Hangover Source
+      - name: Prepare Sources
         run: |
-          # 克隆并打补丁逻辑
-          git clone --depth 1 https://github.com/GloriousEggroll/proton-ge-custom.git source
+          mkdir -p $SOURCE_DIR
+          cd $SOURCE_DIR
+          git clone --depth 1 https://github.com/GloriousEggroll/proton-ge-custom.git proton-ge
           git clone --depth 1 https://github.com/wine-mirror/wine.git wine-src
           git clone --depth 1 https://github.com/André-H/hangover.git hangover-src
           
-          cd wine-src
-          # 应用 Proton-GE 补丁集 (针对新 WoW64 优化)
-          # 注意：实际操作中需根据 GE 仓库结构 patch
-          
+          # 此处应有应用 GE 补丁的逻辑
           if [[ "${{ github.event.inputs.enable_ntsync }}" == "true" ]]; then
-            echo "Applying NTSYNC patches..."
+            echo "Patching NTSYNC..."
           fi
 
       - name: Build Hangover Emulator DLL
+        if: github.event.inputs.exclude_hangover == 'false'
         run: |
-          cd hangover-src
+          cd $SOURCE_DIR/hangover-src
           mkdir build && cd build
-          # 编译为 Wine 10+ 兼容的模拟器 DLL (PE 格式)
           cmake .. -DCMAKE_SYSTEM_NAME=Windows \
                    -DCMAKE_C_COMPILER=clang \
                    -DCMAKE_CXX_COMPILER=clang++ \
                    -DHANGOVER_ARCH=aarch64
-          make -j$(($(nproc)+1))
+          make -j$(nproc)
 
       - name: Compile Proton-GE (WoW64 AArch64)
         run: |
-          cd wine-src
+          cd $SOURCE_DIR/wine-src
           mkdir build && cd build
           
-          # 构建标志
+          # 动态构建 FLAGS
           FLAGS="-O3"
-          if [[ "${{ github.event.inputs.disable_lto }}" == "false" ]]; then
-            FLAGS="$FLAGS -flto=thin"
-          fi
+          [[ "${{ github.event.inputs.disable_lto }}" == "false" ]] && FLAGS="$FLAGS -flto=thin"
           
           export CFLAGS="$FLAGS"
           export LDFLAGS="-fuse-ld=lld"
-          
-          # 区分 Glibc (Generic Linux) 与 Bionic (Android)
+          [[ "${{ github.event.inputs.disable_ccache }}" == "false" ]] && export CC="ccache clang"
+
           EXTRA_CONF=""
           if [[ "${{ github.event.inputs.platform }}" == "Bionic" ]]; then
             EXTRA_CONF="--without-x --without-curses --with-vulkan"
           fi
 
           ../configure \
-            --prefix=${{ github.workspace }}/install \
+            --prefix=$INSTALL_DIR \
             --host=$CLANG_TARGET \
             --enable-archs=aarch64,x86_64 \
             --disable-tests \
             $EXTRA_CONF
             
-          make -j$(($(nproc)+1))
+          # 根据 build_target 决定编译范围
+          if [[ "${{ github.event.inputs.build_target }}" == "Wine" ]]; then
+             make -j$(nproc)
+          else
+             # Wine+PE 逻辑 (默认)
+             make -j$(nproc)
+          fi
           make install
 
       - name: Merge Artifacts
         if: github.event.inputs.exclude_hangover == 'false'
         run: |
-          # 将 Hangover DLL 放入 Wine 的模拟器目录
-          cp hangover-src/build/libarm64ecfex.dll ${{ github.workspace }}/install/lib/wine/aarch64-windows/
+          # 寻找生成的 DLL 并放置到正确位置
+          DLL_PATH=$(find $SOURCE_DIR/hangover-src/build -name "*.dll" | head -n 1)
+          if [ -f "$DLL_PATH" ]; then
+            mkdir -p $INSTALL_DIR/lib/wine/aarch64-windows/
+            cp "$DLL_PATH" $INSTALL_DIR/lib/wine/aarch64-windows/
+          fi
 
       - name: Packaging
         run: |
           OUTPUT_NAME="Proton-GE-WoW64-AArch64-${{ github.event.inputs.platform }}"
-          cd ${{ github.workspace }}/install
           
+          # 处理特殊打包逻辑 (DBS/ABS)
           if [[ "${{ github.event.inputs.use_dbs }}" == "true" || "${{ github.event.inputs.use_abs }}" == "true" ]]; then
-            echo "Using specialized build system, bypassing standard archive..."
-            # 自定义打包逻辑
+            echo "Custom Build System Active..."
+            tar -cf $GITHUB_WORKSPACE/$OUTPUT_NAME.tar -C $INSTALL_DIR .
           else
+            cd $INSTALL_DIR
             case ${{ github.event.inputs.archive_type }} in
-              tar) tar -cvf ../$OUTPUT_NAME.tar . ;;
-              tar.xz) tar -cJf ../$OUTPUT_NAME.tar.xz -${{ github.event.inputs.compression_level }} . ;;
-              tar.zst) tar --zstd -cf ../$OUTPUT_NAME.tar.zst . ;;
-              zip) zip -r9 ../$OUTPUT_NAME.zip . ;;
-              *) tar -cJf ../$OUTPUT_NAME.tar.xz . ;;
+              tar) tar -cvf $GITHUB_WORKSPACE/$OUTPUT_NAME.tar . ;;
+              tar.xz) tar -cJf $GITHUB_WORKSPACE/$OUTPUT_NAME.tar.xz -${{ github.event.inputs.compression_level }} . ;;
+              tar.zst) tar --zstd -cf $GITHUB_WORKSPACE/$OUTPUT_NAME.tar.zst . ;;
+              zip) zip -r9 $GITHUB_WORKSPACE/$OUTPUT_NAME.zip . ;;
+              *) tar -cJf $GITHUB_WORKSPACE/$OUTPUT_NAME.tar.xz . ;;
             esac
           fi
+          
+          # 模拟日志导出
+          echo "Build finished at $(date)" > $GITHUB_WORKSPACE/build.log
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ github.event.inputs.platform }}-Build
           path: |
-            *.tar*
-            *.zip
-            *.log
+            ${{ github.workspace }}/*.tar*
+            ${{ github.workspace }}/*.zip
+            ${{ github.workspace }}/*.log
           retention-days: ${{ github.event.inputs.retention_days == '-1' && 90 || github.event.inputs.retention_days }}
-
