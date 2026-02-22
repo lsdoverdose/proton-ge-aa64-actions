@@ -51,24 +51,10 @@ on:
         description: '关闭 LTO'
         type: boolean
         default: false
-      use_dbs:
-        description: '使用 DBS (Distro Build System)'
-        type: boolean
-        default: false
-      use_abs:
-        description: '使用 ABS (Arch Build System)'
-        type: boolean
-        default: false
       exclude_hangover:
         description: '不打包 Hangover 到 Wine'
         type: boolean
         default: false
-      hangover_emulator:
-        description: 'Hangover 模拟器类型'
-        required: false
-        default: 'fex'
-        type: choice
-        options: [fex, box64, qemu]
 
 env:
   CCACHE_DIR: ${{ github.workspace }}/.ccache
@@ -87,87 +73,45 @@ jobs:
 
       - name: Setup Build Environment
         run: |
-          # 添加 ARM64 架构支持
           sudo dpkg --add-architecture arm64
-          
-          # 修复软件源：为默认源添加 amd64 限制，并添加 ports 源用于 arm64
           sudo tee /etc/apt/sources.list.d/ubuntu.sources << 'EOF'
           Types: deb
-          URIs: http://archive.ubuntu.com/ubuntu/
-          Suites: noble noble-updates noble-backports
-          Components: main restricted universe multiverse
-          Architectures: amd64
-          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
-
-          Types: deb
-          URIs: http://security.ubuntu.com/ubuntu/
-          Suites: noble-security
+          URIs: http://archive.ubuntu.com/ubuntu/ http://security.ubuntu.com/ubuntu/
+          Suites: noble noble-updates noble-backports noble-security
           Components: main restricted universe multiverse
           Architectures: amd64
           Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
 
           Types: deb
           URIs: http://ports.ubuntu.com/ubuntu-ports/
-          Suites: noble noble-updates noble-backports
-          Components: main restricted universe multiverse
-          Architectures: arm64
-          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
-
-          Types: deb
-          URIs: http://ports.ubuntu.com/ubuntu-ports/
-          Suites: noble-security
+          Suites: noble noble-updates noble-backports noble-security
           Components: main restricted universe multiverse
           Architectures: arm64
           Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
           EOF
           
           sudo apt-get update
-          
-          # 安装交叉编译工具 (amd64 架构)
-          sudo apt-get install -y \
-            ccache clang lld llvm \
-            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
-            binutils-aarch64-linux-gnu \
-            mingw-w64 mingw-w64-tools \
-            flex bison gettext libpcsclite-dev \
-            libvulkan-dev libvulkan1 \
-            cmake ninja-build git \
-            zstd xz-utils unzip wget
-          
-          # 安装 ARM64 架构的运行时库 (用于交叉编译链接)
-          sudo apt-get install -y \
-            libc6:arm64 \
-            libstdc++6:arm64 || true
+          sudo apt-get install -y ccache clang lld llvm gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu mingw-w64 mingw-w64-tools flex bison gettext libpcsclite-dev libvulkan-dev libvulkan1 cmake ninja-build git zstd xz-utils unzip wget
+          sudo apt-get install -y libc6:arm64 libstdc++6:arm64 || true
 
-      - name: Install llvm-mingw (for PE cross-compilation)
+      - name: Install llvm-mingw
         run: |
-          # 下载 llvm-mingw 工具链 (用于构建 ARM64 PE DLL)
-          # 使用 20240619 版本，基于 Ubuntu 20.04 构建但兼容 24.04
           LLVM_MINGW_VERSION="20240619"
           LLVM_MINGW_URL="https://github.com/mstorsjo/llvm-mingw/releases/download/${LLVM_MINGW_VERSION}/llvm-mingw-${LLVM_MINGW_VERSION}-ucrt-ubuntu-20.04-x86_64.tar.xz"
-          
-          echo "Downloading llvm-mingw from ${LLVM_MINGW_URL}..."
           wget -q --show-progress "$LLVM_MINGW_URL" -O /tmp/llvm-mingw.tar.xz
-          
-          echo "Extracting llvm-mingw..."
           sudo mkdir -p /opt/llvm-mingw
           sudo tar -xf /tmp/llvm-mingw.tar.xz -C /opt/llvm-mingw --strip-components=1
           
-          # 设置环境变量
+          # 创建 ARM64EC 的编译器软链接修复 CMake 识别问题
+          cd /opt/llvm-mingw/bin
+          sudo ln -s aarch64-w64-mingw32-clang arm64ec-w64-mingw32-clang
+          sudo ln -s aarch64-w64-mingw32-clang++ arm64ec-w64-mingw32-clang++
+          sudo ln -s aarch64-w64-mingw32-clang arm64ec-w64-mingw32-gcc
+          sudo ln -s aarch64-w64-mingw32-clang++ arm64ec-w64-mingw32-g++
+          sudo ln -s aarch64-w64-mingw32-clang arm64ec-w64-mingw32-as
+          
           echo "LLVM_MINGW=/opt/llvm-mingw" >> $GITHUB_ENV
           echo "/opt/llvm-mingw/bin" >> $GITHUB_PATH
-          
-          # 验证安装
-          echo "Installed llvm-mingw version:"
-          /opt/llvm-mingw/bin/aarch64-w64-mingw32-clang --version
-          /opt/llvm-mingw/bin/arm64ec-w64-mingw32-clang --version || echo "ARM64EC compiler not available in this version"
-          
-          if [[ "${{ github.event.inputs.platform }}" == "Bionic" ]]; then
-            echo "ANDROID_NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> $GITHUB_ENV
-            echo "ANDROID_NDK_ROOT=$ANDROID_NDK_LATEST_HOME" >> $GITHUB_ENV
-          fi
-
-
 
       - name: Cache Ccache
         if: github.event.inputs.disable_ccache == 'false'
@@ -181,302 +125,114 @@ jobs:
         run: |
           mkdir -p $SOURCE_DIR $BUILD_DIR $INSTALL_DIR
           cd $SOURCE_DIR
-          
-          # 克隆 Proton-GE (包含 Wine 子模块)
           git clone --recurse-submodules --depth=1 https://github.com/gloriouseggroll/proton-ge-custom
-          
-          # 克隆 Hangover (包含子模块)
           if [[ "${{ github.event.inputs.exclude_hangover }}" == "false" ]]; then
             git clone --recurse-submodules --depth=1 https://github.com/AndreRH/hangover.git hangover-src
           fi
-          
-          # 应用 Proton-GE 补丁
           cd proton-ge-custom
           ./patches/protonprep-valve-staging.sh || true
-          
-          # NTSYNC 补丁
-          if [[ "${{ github.event.inputs.enable_ntsync }}" == "true" ]]; then
-            echo "Applying NTSYNC patches..."
-            # 这里应该应用实际的 NTSYNC 补丁
-            # patch -p1 < patches/ntsync.patch || true
-          fi
 
-      - name: Build Hangover Emulator DLLs (PE)
+      - name: Build Hangover Emulator DLLs (FEX PE)
         if: github.event.inputs.exclude_hangover == 'false'
         run: |
+          export PATH="/opt/llvm-mingw/bin:$PATH"
           cd $SOURCE_DIR/hangover-src
-          
-          # 初始化子模块 (FEX, Box64 等)
           git submodule update --init --recursive
           
-          EMULATOR="${{ github.event.inputs.hangover_emulator }}"
+          if [ ! -d "fex" ]; then
+            git clone --depth 1 https://github.com/FEX-Emu/FEX.git fex
+          fi
           
-          case $EMULATOR in
-            fex)
-              echo "Building FEX Emulators..."
-              
-              # 检查 FEX 子模块是否存在
-              if [ ! -d "fex" ]; then
-                echo "FEX submodule not found, cloning manually..."
-                git clone --depth 1 https://github.com/FEX-Emu/FEX.git fex
-              fi
-              
-              # FEX ARM64EC (x86_64 模拟) - 使用 ARM64EC ABI
-              mkdir -p fex/build-arm64ec && cd fex/build-arm64ec
-              cmake -GNinja \
-                -DCMAKE_BUILD_TYPE=Release \
-                -DCMAKE_TOOLCHAIN_FILE=../Data/CMake/toolchain_mingw.cmake \
-                -DMINGW_TRIPLE=arm64ec-w64-mingw32 \
-                -DENABLE_LTO=${{ github.event.inputs.disable_lto == 'false' && 'True' || 'False' }} \
-                -DBUILD_TESTING=False \
-                -DENABLE_JEMALLOC_GLIBC_ALLOC=False \
-                -DCMAKE_INSTALL_PREFIX=$INSTALL_DIR \
-                ..
-              ninja libarm64ecfex || make -j$(nproc) libarm64ecfex
-              
-              cd ../..
-              # FEX WOW64 (x86 模拟) - 标准 ARM64
-              mkdir -p fex/build-wow64 && cd fex/build-wow64
-              cmake -GNinja \
-                -DCMAKE_BUILD_TYPE=Release \
-                -DCMAKE_TOOLCHAIN_FILE=../Data/CMake/toolchain_mingw.cmake \
-                -DMINGW_TRIPLE=aarch64-w64-mingw32 \
-                -DENABLE_LTO=${{ github.event.inputs.disable_lto == 'false' && 'True' || 'False' }} \
-                -DBUILD_TESTING=False \
-                -DENABLE_JEMALLOC_GLIBC_ALLOC=False \
-                -DCMAKE_INSTALL_PREFIX=$INSTALL_DIR \
-                ..
-              ninja libwow64fex || make -j$(nproc) libwow64fex
-              ;;
-              
-            box64)
-              echo "Building Box64..."
-              
-              # 检查 Box64 子模块
-              if [ ! -d "box64" ]; then
-                echo "Box64 submodule not found, cloning manually..."
-                git clone --depth 1 https://github.com/ptitSeb/box64.git box64
-              fi
-              
-              mkdir -p box64/build && cd box64/build
-              cmake -GNinja \
-                -DCMAKE_BUILD_TYPE=Release \
-                -DCMAKE_TOOLCHAIN_FILE=../../Data/CMake/toolchain_mingw.cmake \
-                -DMINGW_TRIPLE=aarch64-w64-mingw32 \
-                -DBUILD_TESTING=False \
-                ..
-              ninja wowbox64 || make -j$(nproc) wowbox64
-              ;;
-              
-            qemu)
-              echo "QEMU support has been removed from Hangover, please use FEX or Box64"
-              exit 1
-              ;;
-          esac
+          LTO_FLAG=${{ github.event.inputs.disable_lto == 'false' && 'True' || 'False' }}
+          
+          mkdir -p fex/build-arm64ec && cd fex/build-arm64ec
+          cmake -GNinja -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=../Data/CMake/toolchain_mingw.cmake -DMINGW_TRIPLE=arm64ec-w64-mingw32 -DENABLE_LTO=$LTO_FLAG -DBUILD_TESTING=False -DENABLE_JEMALLOC_GLIBC_ALLOC=False -DCMAKE_INSTALL_PREFIX=$INSTALL_DIR ..
+          ninja libarm64ecfex || make -j$(nproc) libarm64ecfex
+          
+          cd ../..
+          mkdir -p fex/build-wow64 && cd fex/build-wow64
+          cmake -GNinja -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=../Data/CMake/toolchain_mingw.cmake -DMINGW_TRIPLE=aarch64-w64-mingw32 -DENABLE_LTO=$LTO_FLAG -DBUILD_TESTING=False -DENABLE_JEMALLOC_GLIBC_ALLOC=False -DCMAKE_INSTALL_PREFIX=$INSTALL_DIR ..
+          ninja libwow64fex || make -j$(nproc) libwow64fex
 
-
-      - name: Build Wine Native (Tools)
+      - name: Build Wine Native & WoW64 AArch64
         run: |
+          export PATH="/opt/llvm-mingw/bin:$PATH"
           cd $SOURCE_DIR/proton-ge-custom/wine
           mkdir -p build-native && cd build-native
+          ../configure --prefix=$BUILD_DIR/wine-tools --enable-win64 --disable-tests --without-x --without-wayland --without-vulkan --disable-winevdm
+          make -j$(nproc) __tooldeps__ && make install __tooldeps__
           
-          # 首先构建原生 Wine 工具 (wine-tools)
-          ../configure \
-            --prefix=$BUILD_DIR/wine-tools \
-            --enable-win64 \
-            --disable-tests \
-            --without-x \
-            --without-wayland \
-            --without-vulkan \
-            --disable-winevdm
+          cd ../ && mkdir -p build-hangover && cd build-hangover
+          CONF_FLAGS="--prefix=$INSTALL_DIR --host=aarch64-linux-gnu --enable-archs=arm64ec,aarch64,i386 --with-mingw=clang --disable-tests"
+          [[ "${{ github.event.inputs.platform }}" == "Bionic" ]] && CONF_FLAGS="$CONF_FLAGS --without-x --without-curses --with-vulkan" || CONF_FLAGS="$CONF_FLAGS --with-x --with-vulkan --with-pulse"
+          [[ "${{ github.event.inputs.enable_ntsync }}" == "true" ]] && CONF_FLAGS="$CONF_FLAGS --with-ntsync"
+          [[ "${{ github.event.inputs.enable_fsync }}" == "true" ]] && CONF_FLAGS="$CONF_FLAGS --with-fsync"
           
-          make -j$(nproc) __tooldeps__
-          make install __tooldeps__
-
-      - name: Build Wine Hangover (WoW64 AArch64)
-        run: |
-          cd $SOURCE_DIR/proton-ge-custom/wine
-          mkdir -p build-hangover && cd build-hangover
+          export CC="${{ github.event.inputs.disable_ccache == 'false' && 'ccache ' || '' }}aarch64-linux-gnu-gcc"
+          export CXX="${{ github.event.inputs.disable_ccache == 'false' && 'ccache ' || '' }}aarch64-linux-gnu-g++"
+          OPT_FLAGS="-O3 -march=armv8.3-a ${{ github.event.inputs.disable_lto == 'false' && '-flto=thin' || '' }}"
           
-          # 配置编译选项
-          CONF_FLAGS="--prefix=$INSTALL_DIR \
-            --host=aarch64-linux-gnu \
-            --enable-archs=arm64ec,aarch64,i386 \
-            --with-mingw=clang \
-            --disable-tests"
-          
-          # 平台特定选项
-          if [[ "${{ github.event.inputs.platform }}" == "Bionic" ]]; then
-            CONF_FLAGS="$CONF_FLAGS --without-x --without-curses --with-vulkan"
-          else
-            CONF_FLAGS="$CONF_FLAGS --with-x --with-vulkan --with-pulse"
-          fi
-          
-          # NTSYNC/FSYNC
-          if [[ "${{ github.event.inputs.enable_ntsync }}" == "true" ]]; then
-            CONF_FLAGS="$CONF_FLAGS --with-ntsync"
-          fi
-          
-          if [[ "${{ github.event.inputs.enable_fsync }}" == "true" ]]; then
-            CONF_FLAGS="$CONF_FLAGS --with-fsync"
-          fi
-          
-          # 使用 Ccache
-          if [[ "${{ github.event.inputs.disable_ccache }}" == "false" ]]; then
-            export CC="ccache aarch64-linux-gnu-gcc"
-            export CXX="ccache aarch64-linux-gnu-g++"
-          else
-            export CC="aarch64-linux-gnu-gcc"
-            export CXX="aarch64-linux-gnu-g++"
-          fi
-          
-          # 编译器优化
-          OPT_FLAGS="-O3 -march=armv8.3-a"
-          if [[ "${{ github.event.inputs.disable_lto }}" == "false" ]]; then
-            OPT_FLAGS="$OPT_FLAGS -flto=thin"
-          fi
-          
-          export CFLAGS="$OPT_FLAGS"
-          export CXXFLAGS="$OPT_FLAGS"
-          export LDFLAGS="-fuse-ld=lld"
-          
-          # 设置工具路径
+          export CFLAGS="$OPT_FLAGS" && export CXXFLAGS="$OPT_FLAGS" && export LDFLAGS="-fuse-ld=lld"
           export WINE_TOOLS=$BUILD_DIR/wine-tools
           
-          # 配置
           ../configure $CONF_FLAGS
-          
-          # 编译
-          if [[ "${{ github.event.inputs.build_target }}" == "Wine" ]]; then
-            make -j$(nproc)
-          else
-            # Wine+PE: 编译所有组件包括 PE 模块
-            make -j$(nproc) all
-          fi
-          
+          [[ "${{ github.event.inputs.build_target }}" == "Wine" ]] && make -j$(nproc) || make -j$(nproc) all
           make install
 
       - name: Merge Hangover Artifacts
         if: github.event.inputs.exclude_hangover == 'false'
         run: |
-          EMULATOR="${{ github.event.inputs.hangover_emulator }}"
-          
-          case $EMULATOR in
-            fex)
-              # 复制 FEX DLLs
-              mkdir -p $INSTALL_DIR/lib/wine/aarch64-windows/
-              if [ -f "$SOURCE_DIR/hangover-src/build-arm64ec/Bin/libarm64ecfex.dll" ]; then
-                cp "$SOURCE_DIR/hangover-src/build-arm64ec/Bin/libarm64ecfex.dll" $INSTALL_DIR/lib/wine/aarch64-windows/
-              fi
-              if [ -f "$SOURCE_DIR/hangover-src/build-wow64/Bin/libwow64fex.dll" ]; then
-                cp "$SOURCE_DIR/hangover-src/build-wow64/Bin/libwow64fex.dll" $INSTALL_DIR/lib/wine/aarch64-windows/
-              fi
-              ;;
-            box64)
-              if [ -f "$SOURCE_DIR/hangover-src/build/wowbox64.dll" ]; then
-                mkdir -p $INSTALL_DIR/lib/wine/aarch64-windows/
-                cp "$SOURCE_DIR/hangover-src/build/wowbox64.dll" $INSTALL_DIR/lib/wine/aarch64-windows/
-              fi
-              ;;
-            qemu)
-              # QEMU 作为 Unix 库使用，不是 DLL
-              if [ -f "$SOURCE_DIR/hangover-src/qemu/build/libqemu-i386.so" ]; then
-                mkdir -p $INSTALL_DIR/lib/
-                cp "$SOURCE_DIR/hangover-src/qemu/build/libqemu-i386.so" $INSTALL_DIR/lib/
-              fi
-              ;;
-          esac
-          
-          # 设置默认模拟器配置
-          echo "HODLL64=libarm64ecfex.dll" > $INSTALL_DIR/share/wine/hangover.conf
-          echo "HODLL=libwow64fex.dll" >> $INSTALL_DIR/share/wine/hangover.conf
+          mkdir -p $INSTALL_DIR/lib/wine/aarch64-windows/ $INSTALL_DIR/share/wine
+          cp -f $SOURCE_DIR/hangover-src/fex/build-arm64ec/Bin/libarm64ecfex.dll $INSTALL_DIR/lib/wine/aarch64-windows/ || true
+          cp -f $SOURCE_DIR/hangover-src/fex/build-wow64/Bin/libwow64fex.dll $INSTALL_DIR/lib/wine/aarch64-windows/ || true
+          echo -e "HODLL64=libarm64ecfex.dll\nHODLL=libwow64fex.dll" > $INSTALL_DIR/share/wine/hangover.conf
 
       - name: Build Proton Components
         if: github.event.inputs.build_target == 'Wine+PE'
         run: |
+          export PATH="/opt/llvm-mingw/bin:$PATH"
           cd $SOURCE_DIR/proton-ge-custom
-          
-          # 构建 dxvk、vkd3d-proton 等组件
-          if [ -d "dxvk" ]; then
-            cd dxvk
-            ./package-release.sh master $INSTALL_DIR --no-package
-          fi
-          
-          if [ -d "vkd3d-proton" ]; then
-            cd ../vkd3d-proton
-            ./package-release.sh master $INSTALL_DIR --no-package
-          fi
+          [ -d "dxvk" ] && (cd dxvk && ./package-release.sh master $INSTALL_DIR --no-package)
+          [ -d "vkd3d-proton" ] && (cd vkd3d-proton && ./package-release.sh master $INSTALL_DIR --no-package)
 
       - name: Packaging
         run: |
-          PLATFORM="${{ github.event.inputs.platform }}"
-          ARCHIVE_TYPE="${{ github.event.inputs.archive_type }}"
-          COMPRESSION="${{ github.event.inputs.compression_level }}"
-          OUTPUT_NAME="Proton-GE-WoW64-AArch64-${PLATFORM}-$(date +%Y%m%d)"
+          OUTPUT_NAME="Proton-GE-WoW64-AArch64-${{ github.event.inputs.platform }}-$(date +%Y%m%d)"
+          mkdir -p $GITHUB_WORKSPACE/output $GITHUB_WORKSPACE/staging
           
-          mkdir -p $GITHUB_WORKSPACE/output
+          # 根据 artifact_output 选择打包内容
+          if [[ "${{ github.event.inputs.artifact_output }}" == *"out"* || "${{ github.event.inputs.artifact_output }}" == "all" ]]; then
+            cp -r $INSTALL_DIR/* $GITHUB_WORKSPACE/staging/
+          fi
+          if [[ "${{ github.event.inputs.artifact_output }}" == *"bin"* ]]; then
+            mkdir -p $GITHUB_WORKSPACE/staging/bin && cp -r $INSTALL_DIR/bin/* $GITHUB_WORKSPACE/staging/bin/ || true
+          fi
           
-          # 处理 DBS/ABS 特殊构建
-          if [[ "${{ github.event.inputs.use_dbs }}" == "true" || "${{ github.event.inputs.use_abs }}" == "true" ]]; then
-            echo "Using Custom Build System..."
-            # 创建符合发行版规范的包
-            tar -cf $GITHUB_WORKSPACE/output/$OUTPUT_NAME.tar -C $INSTALL_DIR .
-          else
-            cd $INSTALL_DIR
-            
-            case $ARCHIVE_TYPE in
-              tar)
-                tar -cvf $GITHUB_WORKSPACE/output/$OUTPUT_NAME.tar .
-                ;;
-              tar.xz)
-                XZ_OPT="-$COMPRESSION" tar -cJf $GITHUB_WORKSPACE/output/$OUTPUT_NAME.tar.xz .
-                ;;
-              tar.zst)
-                tar --zstd -cf $GITHUB_WORKSPACE/output/$OUTPUT_NAME.tar.zst .
-                ;;
-              tar.gz)
-                tar -czf $GITHUB_WORKSPACE/output/$OUTPUT_NAME.tar.gz .
-                ;;
-              tar.lz)
-                tar --lzip -cf $GITHUB_WORKSPACE/output/$OUTPUT_NAME.tar.lz .
-                ;;
-              zip)
-                zip -r9 $GITHUB_WORKSPACE/output/$OUTPUT_NAME.zip .
-                ;;
-              *)
-                tar -cJf $GITHUB_WORKSPACE/output/$OUTPUT_NAME.tar.xz .
-                ;;
+          if [[ "${{ github.event.inputs.artifact_output }}" != "log" ]]; then
+            cd $GITHUB_WORKSPACE/staging
+            case ${{ github.event.inputs.archive_type }} in
+              tar) tar -cf $GITHUB_WORKSPACE/output/$OUTPUT_NAME.tar . ;;
+              tar.xz) XZ_OPT="-${{ github.event.inputs.compression_level }}" tar -cJf $GITHUB_WORKSPACE/output/$OUTPUT_NAME.tar.xz . ;;
+              tar.zst) tar --zstd -cf $GITHUB_WORKSPACE/output/$OUTPUT_NAME.tar.zst . ;;
+              tar.gz) tar -czf $GITHUB_WORKSPACE/output/$OUTPUT_NAME.tar.gz . ;;
+              tar.lz) tar --lzip -cf $GITHUB_WORKSPACE/output/$OUTPUT_NAME.tar.lz . ;;
+              zip) zip -r${{ github.event.inputs.compression_level }} $GITHUB_WORKSPACE/output/$OUTPUT_NAME.zip . ;;
             esac
           fi
           
-          # 生成构建日志
-          {
-            echo "Build Log for Proton-GE WoW64 AArch64"
-            echo "===================================="
-            echo "Build Date: $(date)"
-            echo "Platform: $PLATFORM"
-            echo "Target: ${{ github.event.inputs.build_target }}"
-            echo "Emulator: ${{ github.event.inputs.hangover_emulator }}"
-            echo "NTSYNC: ${{ github.event.inputs.enable_ntsync }}"
-            echo "FSYNC: ${{ github.event.inputs.enable_fsync }}"
-            echo "LTO: ${{ github.event.inputs.disable_lto == 'false' && 'Enabled' || 'Disabled' }}"
-            echo "CCache: ${{ github.event.inputs.disable_ccache == 'false' && 'Enabled' || 'Disabled' }}"
-            echo ""
-            echo "Compiler: $(aarch64-linux-gnu-gcc --version | head -n1)"
-            echo "Clang: $(clang --version | head -n1)"
-            echo ""
-            echo "Wine Configuration:"
-            cat $SOURCE_DIR/proton-ge-custom/wine/build-hangover/config.log 2>/dev/null | grep -E "^(configure|CC|CXX|CFLAGS)" || true
-          } > $GITHUB_WORKSPACE/output/build.log
-          
-          # 生成清单文件
-          find $INSTALL_DIR -type f | sort > $GITHUB_WORKSPACE/output/manifest.txt
+          # 生成日志
+          if [[ "${{ github.event.inputs.artifact_output }}" == *"log"* || "${{ github.event.inputs.artifact_output }}" == "all" ]]; then
+            {
+              echo "Build Date: $(date)"
+              echo "Target: ${{ github.event.inputs.build_target }}"
+              cat $SOURCE_DIR/proton-ge-custom/wine/build-hangover/config.log 2>/dev/null | grep -E "^(configure|CC|CXX|CFLAGS)" || true
+            } > $GITHUB_WORKSPACE/output/build.log
+          fi
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: Proton-GE-WoW64-AArch64-${{ github.event.inputs.platform }}
-          path: |
-            ${{ github.workspace }}/output/
+          path: ${{ github.workspace }}/output/
           retention-days: ${{ github.event.inputs.retention_days == '-1' && '90' || github.event.inputs.retention_days }}
           if-no-files-found: error
